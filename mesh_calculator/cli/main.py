@@ -166,7 +166,7 @@ def main(config: str, output: str, verbose: bool, quiet: bool):
                 los_hit_rate=f"{cache_stats['hit_rate']:.1%}")
 
     elev_stats = elevation_provider.cache_stats()
-    logger.info("Elevation cache", entries=elev_stats['cache_size'])
+    logger.info("Elevation cache", **elev_stats)
 
     logger.info("Optimization complete",
                 towers_placed=len(surface.towers),
