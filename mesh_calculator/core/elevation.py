@@ -2,18 +2,16 @@
 Elevation data handling with caching for mesh calculator.
 """
 import threading
-import warnings
 from typing import Optional, Tuple
 import h3
 import rasterio
-from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import rowcol
 from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
-from rasterio.features import geometry_mask, rasterize
+from rasterio.features import geometry_mask
 import numpy as np
-from shapely.geometry import LineString, Polygon, mapping
+from shapely.geometry import Polygon, mapping
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -228,6 +226,20 @@ class ElevationProvider:
             return (a[0], a[1], b[0], b[1]), False
         return (b[0], b[1], a[0], a[1]), True
 
+    def _read_window(self, win: Window) -> np.ma.MaskedArray:
+        """Read a window from the in-memory array (or dataset as fallback).
+
+        Returns a masked array consistent with dataset.read(1, window=win, masked=True).
+        """
+        self._ensure_data()
+        r0 = int(win.row_off)
+        c0 = int(win.col_off)
+        r1 = r0 + int(win.height)
+        c1 = c0 + int(win.width)
+        data = self._data[r0:r1, c0:c1].copy()
+        # Since _ensure_data replaces nodata with 0.0, we have no masked values
+        return np.ma.array(data, mask=False)
+
     def _clip_window(self, window: Window) -> Optional[Window]:
         full = Window(0, 0, self.dataset.width, self.dataset.height)
         try:
@@ -302,8 +314,7 @@ class ElevationProvider:
                 self._cell_max_cache[h3_index] = 0.0
                 return 0.0
 
-            with self._lock:
-                band = self.dataset.read(1, window=win, masked=True)
+            band = self._read_window(win)
             w_transform = window_transform(win, self.transform)
             inside = geometry_mask(
                 [mapping(polygon)],
@@ -394,8 +405,7 @@ class ElevationProvider:
         win = self._clip_window(raw_window)
         if win is None:
             return None
-        with self._lock:
-            band = self.dataset.read(1, window=win, masked=True)
+        band = self._read_window(win)
         w_transform = window_transform(win, self.transform)
         inside = geometry_mask(
             [mapping(polygon)],
@@ -507,13 +517,26 @@ class ElevationProvider:
                     elev = self.get_elevation(a_lat, a_lon)
                     cached = (float(elev), float(a_lat), float(a_lon), 0.0)
                 else:
-                    line = LineString([(a_lon, a_lat), (b_lon, b_lat)])
-                    minx, miny, maxx, maxy = line.bounds
-                    raw_window = window_from_bounds(
-                        minx, miny, maxx, maxy, transform=self.transform
-                    )
-                    win = self._clip_window(raw_window)
-                    if win is None:
+                    self._ensure_data()
+                    h, w = self.dataset.height, self.dataset.width
+
+                    # Get pixel coordinates for endpoints
+                    r_a, c_a = rowcol(self.transform, a_lon, a_lat)
+                    r_b, c_b = rowcol(self.transform, b_lon, b_lat)
+
+                    # Bresenham-style line sampling: walk all pixels along the line
+                    n_steps = max(abs(r_b - r_a), abs(c_b - c_a), 1)
+                    t = np.linspace(0.0, 1.0, n_steps + 1)
+                    rows = np.round(r_a + (r_b - r_a) * t).astype(np.intp)
+                    cols = np.round(c_a + (c_b - c_a) * t).astype(np.intp)
+
+                    # Filter to in-bounds pixels and deduplicate
+                    valid = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+                    rows = rows[valid]
+                    cols = cols[valid]
+                    t_valid = t[valid]
+
+                    if len(rows) == 0:
                         elev_a = self.get_elevation(a_lat, a_lon)
                         elev_b = self.get_elevation(b_lat, b_lon)
                         if elev_a >= elev_b:
@@ -521,25 +544,18 @@ class ElevationProvider:
                         else:
                             cached = (float(elev_b), float(b_lat), float(b_lon), 1.0)
                     else:
-                        with self._lock:
-                            band = self.dataset.read(1, window=win, masked=True)
-                        w_transform = window_transform(win, self.transform)
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings(
-                                "ignore",
-                                category=NotGeoreferencedWarning,
-                            )
-                            line_mask = rasterize(
-                                [(mapping(line), 1)],
-                                out_shape=band.shape,
-                                transform=w_transform,
-                                fill=0,
-                                all_touched=True,
-                                dtype=np.uint8,
-                            )
-                        valid = (line_mask == 1) & (~np.ma.getmaskarray(band))
-                        max_elev = self._safe_max(band, valid)
-                        if max_elev is None:
+                        # Deduplicate (keep unique row,col pairs preserving order)
+                        rc = rows.astype(np.int64) * w + cols.astype(np.int64)
+                        _, unique_idx = np.unique(rc, return_index=True)
+                        unique_idx.sort()
+                        rows = rows[unique_idx]
+                        cols = cols[unique_idx]
+                        t_valid = t_valid[unique_idx]
+
+                        elevs = self._data[rows, cols]
+                        finite_mask = np.isfinite(elevs)
+
+                        if not np.any(finite_mask):
                             elev_a = self.get_elevation(a_lat, a_lon)
                             elev_b = self.get_elevation(b_lat, b_lon)
                             if elev_a >= elev_b:
@@ -547,33 +563,38 @@ class ElevationProvider:
                             else:
                                 cached = (float(elev_b), float(b_lat), float(b_lon), 1.0)
                         else:
-                            rows, cols = np.where(valid & (band.data == max_elev))
-                            if len(rows) == 0:
-                                peak_lat = (a_lat + b_lat) / 2.0
-                                peak_lon = (a_lon + b_lon) / 2.0
+                            max_elev = float(np.max(elevs[finite_mask]))
+                            # Among pixels with max elevation, pick closest to midpoint
+                            peak_mask = finite_mask & (elevs == max_elev)
+                            peak_rows = rows[peak_mask]
+                            peak_cols = cols[peak_mask]
+                            peak_t = t_valid[peak_mask]
+
+                            mid_lat = (a_lat + b_lat) / 2.0
+                            mid_lon = (a_lon + b_lon) / 2.0
+
+                            if len(peak_rows) == 1:
+                                best_idx = 0
                             else:
-                                # Choose max-elevation pixel nearest line midpoint (conservative Fresnel impact).
-                                mid_lat = (a_lat + b_lat) / 2.0
-                                mid_lon = (a_lon + b_lon) / 2.0
-                                peak_lat = None
-                                peak_lon = None
-                                best_d2 = float("inf")
-                                for r, c in zip(rows, cols):
-                                    px_lon, px_lat = rasterio.transform.xy(
-                                        w_transform, int(r), int(c), offset="center"
-                                    )
-                                    d2 = (px_lat - mid_lat) ** 2 + (px_lon - mid_lon) ** 2
-                                    if d2 < best_d2:
-                                        best_d2 = d2
-                                        peak_lat = float(px_lat)
-                                        peak_lon = float(px_lon)
-                                if peak_lat is None or peak_lon is None:
-                                    peak_lat = (a_lat + b_lat) / 2.0
-                                    peak_lon = (a_lon + b_lon) / 2.0
-                            frac = self._line_fraction(
-                                a_lat, a_lon, b_lat, b_lon, peak_lat, peak_lon
+                                # Compute distances to midpoint
+                                peak_lons, peak_lats = rasterio.transform.xy(
+                                    self.transform, peak_rows.tolist(), peak_cols.tolist(),
+                                    offset="center"
+                                )
+                                peak_lats = np.asarray(peak_lats)
+                                peak_lons = np.asarray(peak_lons)
+                                d2 = (peak_lats - mid_lat) ** 2 + (peak_lons - mid_lon) ** 2
+                                best_idx = int(np.argmin(d2))
+
+                            best_lon, best_lat = rasterio.transform.xy(
+                                self.transform, int(peak_rows[best_idx]),
+                                int(peak_cols[best_idx]), offset="center"
                             )
-                            cached = (float(max_elev), float(peak_lat), float(peak_lon), float(frac))
+                            frac = self._line_fraction(
+                                a_lat, a_lon, b_lat, b_lon,
+                                float(best_lat), float(best_lon)
+                            )
+                            cached = (max_elev, float(best_lat), float(best_lon), float(frac))
             except Exception as e:
                 logger.warning(
                     "Failed to get line peak elevation",
